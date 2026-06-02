@@ -1,0 +1,552 @@
+---
+title: "Exercise 2: External PPG Debt by Creditor Class"
+subtitle: "BP3 — Fund's Role in International Debt Architecture"
+output: html_notebook
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(scales)
+cat("✓ Libraries loaded\n")
+```
+
+```{r paths}
+ids_dir    <- "U:/dil/bp3/input/data/data/IDS"
+characteristics_dir   <- "U:/dil/main-characteristics"
+output_dir <- "U:/dil/bp3/output"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# Load and combine all 6 IDS files
+
+This will take a few minutes per file.
+
+```{r load-ids}
+files <- c("A_D.xlsx", "E_K.xlsx", "L_M.xlsx", "N_Q.xlsx", "R_U.xlsx", "V_Z.xlsx")
+
+ids_list <- list()
+for (f in files) {
+  cat("Loading", f, "...\n")
+  ids_list[[f]] <- read.xlsx(file.path(ids_dir, f))
+  cat("  ✓", format(nrow(ids_list[[f]]), big.mark = ","), "rows\n")
+}
+
+year_cols <- names(ids_list[[1]])[grepl("^\\d{4}$", names(ids_list[[1]]))]
+
+for (i in seq_along(ids_list)) {
+  ids_list[[i]][year_cols] <- lapply(ids_list[[i]][year_cols], as.character)
+}
+
+ids_raw <- bind_rows(ids_list)
+rm(ids_list)
+gc()
+
+cat("✓ Combined:", format(nrow(ids_raw), big.mark = ","), "rows\n")
+
+cat("\n✓ Combined:", format(nrow(ids_raw), big.mark = ","), "rows\n")
+cat("Countries:", n_distinct(ids_raw$Country.Name), "\n")
+cat("Series:", n_distinct(ids_raw$Series.Code), "\n")
+```
+---
+
+---
+# Filter to key series only
+
+Keep only what we need — saves memory and speeds up everything.
+
+```{r filter-series}
+keep_series <- c(
+  "DT.DOD.BLAT.CD",   # PPG bilateral DOD
+  "DT.DOD.MLAT.CD",   # PPG multilateral DOD
+  "DT.DOD.PBND.CD",   # PPG bonds DOD
+  "DT.DOD.PCBK.CD",   # PPG commercial banks DOD
+  "DT.DOD.PROP.CD",   # PPG other private creditors
+  "DT.DOD.DIMF.CD",   # IMF credit DOD
+  "DT.DOD.DPPG.CD"    # Total PPG DOD (cross-check)
+)
+
+ids_raw <- ids_raw %>% filter(Series.Code %in% keep_series)
+cat("Filtered to key series:", format(nrow(ids_raw), big.mark = ","), "rows\n")
+
+```
+---
+
+---
+
+# Remove regional aggregates
+
+```{r remove-aggregates}
+remove_these <- c(
+  "East Asia & Pacific (excluding high income)",
+  "Europe & Central Asia (excluding high income)",
+  "IDA only",
+  "IDA total",
+  "Latin America & Caribbean (excluding high income)",
+  "Least developed countries: UN classification",
+  "Low & middle income",
+  "Low income",
+  "Lower middle income",
+  "Middle East & North Africa (excluding high income)",
+  "Middle East, North Africa, Afghanistan & Pakistan (excluding high income)",
+  "Middle income",
+  "South Asia",
+  "Sub-Saharan Africa (excluding high income)",
+  "Upper middle income",
+  "Heavily indebted poor countries (HIPC)",
+  "World"
+)
+
+ids_raw <- ids_raw %>% filter(!Country.Name %in% remove_these)
+cat("After removing aggregates:", n_distinct(ids_raw$Country.Name), "countries\n")
+```
+
+---
+# Reshape to long format
+
+```{r reshape}
+# Reshape: de wide (años como columnas) a long (una fila por año)
+year_cols <- names(ids_raw)[grepl("^\\d{4}$", names(ids_raw))]
+
+ids_long <- ids_raw %>%
+  pivot_longer(cols = all_of(year_cols), names_to = "year", values_to = "value") %>%
+  mutate(year = as.integer(year),
+         value = as.numeric(value)) %>%
+  filter(year >= 1970, year <= 2024, !is.na(value)) %>%
+  rename(country_code = Country.Code,
+         country_name = Country.Name,
+         ca_name = `Counterpart-Area.Name`,
+         ca_code = `Counterpart-Area.Code`,
+         series_name = Series.Name,
+         series_code = Series.Code)
+
+rm(ids_raw)
+gc()
+cat("✓ ids_long:", format(nrow(ids_long), big.mark = ","), "rows\n")
+
+#eliminando el espacio en blanco de al inicio y final
+ids_long <- ids_long %>% mutate(ca_name = trimws(ca_name))
+
+```
+
+---
+
+# PRGT load reference and classify
+
+```{r load-prgt-list}
+# Load reference lists
+prgt_members <- trimws(readLines(file.path(characteristics_dir, "prgt-members.txt"), warn = FALSE))
+prgt_members <- prgt_members[prgt_members != ""]
+cat("PRGT members:", length(prgt_members), "\n")
+
+#Classify
+ids_long <- ids_long %>%
+  mutate(income_group = case_when(
+    country_name %in% prgt_members ~ "LIC",
+    TRUE ~ "MIC"
+    )
+  )
+cat("LIC:", n_distinct(ids_long$country_name[ids_long$income_group == "LIC"]), "\n")
+
+cat("MIC:", n_distinct(ids_long$country_name[ids_long$income_group == "MIC"]), "\n")
+#⚠ Unmatched PRGT: (esta lista son paises que no estan en ids)
+# ✗ Côte d'Ivoire (si esta pero en el ids esta: "Cote d'Ivoire")
+# ✗ Kiribati (no esta)
+# ✗ Marshall Islands (no esta)
+# ✗ Micronesia, Federated States of (no esta)
+# ✗ Somalia (esta como Somalia, Fed. Rep.)
+# ✗ South Sudan (no esta)
+#✗ Tuvalu (no esta)
+
+matched <- ids_long %>% filter(income_group == "LIC") %>% distinct(country_name) %>% pull()
+cat("Matched LICs:\n")
+for (c in sort(matched)) cat("  ✓", c, "\n")
+
+```
+
+---
+
+
+# Paris Club reference and classify
+
+```{r load-pc-list}
+pc_mapping <- tribble(
+  ~ca_code,  ~pc_name,              ~accession_year,
+  "801",     "Australia",           1956,
+  "001",     "Austria",             1956,
+  "002",     "Belgium",             1956,
+  "301",     "Canada",              1956,
+  "003",     "Denmark",             1956,
+  "018",     "Finland",             1956,
+  "004",     "France",              1956,
+  "005",     "Germany, Fed. Rep.",   1956,
+  "021",     "Ireland",             1956,
+  "006",     "Italy",               1956,
+  "701",     "Japan",               1956,
+  "007",     "Netherlands",         1956,
+  "008",     "Norway",              1956,
+  "050",     "Spain",               1956,
+  "010",     "Sweden",              1956,
+  "011",     "Switzerland",         1956,
+  "012",     "United Kingdom",      1956,
+  "302",     "United States",       1956,
+  "087",     "Russian Federation",  1997,
+  "546",     "Israel",              2014,
+  "742",     "Korea, Republic of",  2016,
+  "431",     "Brazil",              2016
+)
+
+# Verify all match in bilateral data
+bilat_ca <- ids_long %>% filter(series_code == "DT.DOD.BLAT.CD") %>% distinct(ca_code)
+cat("PC matched:", sum(pc_mapping$ca_code %in% bilat_ca$ca_code), "of", nrow(pc_mapping), "\n")
+
+```
+---
+# Explore counterpart areas
+
+```{r explore-multilateral-counterparts}
+cat("--- Counterpart areas for MULTILATERAL (DT.DOD.MLAT.CD) ---\n\n")
+ids_long %>%
+  filter(series_code == "DT.DOD.MLAT.CD") %>%
+  distinct(ca_name, ca_code) %>%
+  arrange(ca_name) %>%
+  { for (i in 1:nrow(.)) cat(" ", .$ca_code[i], ":", .$ca_name[i], "\n"); . } %>%
+  invisible()
+
+```
+
+---
+```{r load-pcs-list}
+pcs_codes <- c(
+  "901",  # World Bank-IBRD
+  "905",  # World Bank-IDA
+  "902",  # World Bank-MIGA
+  "903",  # IFC
+  "988",  # IFAD
+  "911",  # BIS
+  "990",  # EBRD
+  "913",  # African Dev. Bank
+  "915",  # Asian Dev. Bank
+  "909",  # Inter-American Dev. Bank
+  "899",  # AIIB
+  "926",  # Council of Europe
+  "906",  # Caribbean Dev. Bank
+  "919",  # European Investment Bank
+  "957",  # BOAD
+  "887",  # NDB
+  "976",  # Islamic Dev. Bank
+  "920",  # CAF
+  "951",  # OPEC Fund
+  "973",  # Arab Monetary Fund
+  "953"   # BADEA
+)
+
+# Verify all match in multilateral data
+mlat_ca <- ids_long %>% filter(series_code == "DT.DOD.MLAT.CD") %>% distinct(ca_code)
+cat("PCS matched:", sum(pcs_codes %in% mlat_ca$ca_code), "of", length(pcs_codes), "\n")
+
+#no estan;
+#European Financial Stability Mechanism, Eurosystem, European Stability Mechanism, Chiang Mai Initiative, BRICS Contingent Reserve, Black Sea Trade and Dev. Bank
+```
+
+
+---
+```{r blat-classification}
+# PC bilateral: suma de creditors individuales que son PC
+bilateral_pc <- ids_long %>%
+  filter(series_code == "DT.DOD.BLAT.CD",
+         ca_code %in% pc_mapping$ca_code) %>%
+  left_join(pc_mapping %>% select(ca_code, accession_year), by = "ca_code") %>%
+  mutate(
+    creditor_class = case_when(
+      year >= accession_year ~ "Bilateral: Paris Club",
+      TRUE ~ "Bilateral: Non-Paris Club"
+    )
+  )
+
+# Total bilateral por país-año (WLD)
+bilateral_total <- ids_long %>%
+  filter(series_code == "DT.DOD.BLAT.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, bilateral_total = value)
+
+cat("PC rows:", nrow(bilateral_pc), "\n")
+cat("Total bilateral rows:", nrow(bilateral_total), "\n")
+```
+
+---
+```{r blat-calculation}
+# Suma de PC por país-año
+pc_sum <- bilateral_pc %>%
+  filter(creditor_class == "Bilateral: Paris Club") %>%
+  group_by(country_name, country_code, year, income_group) %>%
+  summarise(pc_value = sum(value, na.rm = TRUE), .groups = "drop")
+
+# Non-PC = total - PC
+bilateral_nonpc <- bilateral_total %>%
+  left_join(pc_sum, by = c("country_name", "country_code", "year", "income_group")) %>%
+  mutate(
+    pc_value = replace_na(pc_value, 0),
+    nonpc_value = bilateral_total - pc_value
+  )
+
+cat("Rows:", nrow(bilateral_nonpc), "\n")
+
+#contar cuantos negativos.
+   bilateral_nonpc %>% 
+     filter(nonpc_value < 0) %>%
+     summarise(
+       n = n(),
+       min = min(nonpc_value),
+       median = median(nonpc_value),
+       mean = mean(nonpc_value)
+     )
+#11 valore negativos, valores de redondeo, los ponemos en 0
+bilateral_nonpc <- bilateral_nonpc %>%
+  mutate(nonpc_value = pmax(nonpc_value, 0))
+
+#bilateral_nonpc tiene los valores de pc y non pc
+```
+
+
+
+
+
+---
+```{r mlat-calculation}
+# PCS: suma de instituciones PCS individuales
+multilateral_pcs <- ids_long %>%
+  filter(series_code == "DT.DOD.MLAT.CD",
+         ca_code %in% pcs_codes) %>%
+  mutate(creditor_class = "Multilateral: PCS") %>%
+  group_by(country_name, country_code, year, income_group) %>%
+  summarise(pcs_value = sum(value, na.rm = TRUE), .groups = "drop")
+
+# Total multilateral por país-año (WLD)
+multilateral_total <- ids_long %>%
+  filter(series_code == "DT.DOD.MLAT.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, multilateral_total = value)
+
+# Non-PCS = total - PCS
+multilateral_nonpcs <- multilateral_total %>%
+  left_join(multilateral_pcs, by = c("country_name", "country_code", "year", "income_group")) %>%
+  mutate(
+    pcs_value = replace_na(pcs_value, 0),
+    nonpcs_value = multilateral_total - pcs_value,
+    nonpcs_value = pmax(nonpcs_value, 0)
+  )
+
+cat("Multilateral rows:", nrow(multilateral_nonpcs), "\n")
+cat("Negativos:", sum(multilateral_nonpcs$nonpcs_value < 0), "\n")
+
+```
+
+---
+```{r imf-bond-banks-other-calculation}
+imf <- ids_long %>%
+  filter(series_code == "DT.DOD.DIMF.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, imf_value = value)
+
+bonds <- ids_long %>%
+  filter(series_code == "DT.DOD.PBND.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, bonds_value = value)
+
+comm_banks <- ids_long %>%
+  filter(series_code == "DT.DOD.PCBK.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, commbanks_value = value)
+
+other_private <- ids_long %>%
+  filter(series_code == "DT.DOD.PROP.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, otherprivate_value = value)
+
+total_ppg <- ids_long %>%
+  filter(series_code == "DT.DOD.DPPG.CD", ca_code == "WLD") %>%
+  select(country_name, country_code, year, income_group, total_ppg_value = value)
+
+cat("IMF:", nrow(imf), "| Bonds:", nrow(bonds), "| Banks:", nrow(comm_banks),
+    "| Other Private:", nrow(other_private), "| Total PPG:", nrow(total_ppg), "\n")
+```
+
+---
+```{r final-calculation}
+
+final <- bilateral_nonpc %>%
+  select(country_name, country_code, year, income_group, 
+         bilateral_total, pc_value, nonpc_value) %>%
+  left_join(multilateral_nonpcs %>% select(country_name, year, 
+         multilateral_total, pcs_value, nonpcs_value),
+         by = c("country_name", "year")) %>%
+  left_join(bonds, by = c("country_name", "country_code", "year", "income_group")) %>%
+  left_join(comm_banks, by = c("country_name", "country_code", "year", "income_group")) %>%
+  left_join(other_private, by = c("country_name", "country_code", "year", "income_group")) %>%
+  left_join(imf, by = c("country_name", "country_code", "year", "income_group")) %>%
+  left_join(total_ppg, by = c("country_name", "country_code", "year", "income_group"))
+
+# Cross-check: nuestra suma vs total oficial
+#IMF no se debe incluir como parte de PPG total
+
+final <- final %>%
+  mutate(
+    our_sum = rowSums(select(., pc_value, nonpc_value, pcs_value, nonpcs_value,
+                              bonds_value, commbanks_value, otherprivate_value), 
+                      na.rm = TRUE),
+    diff_pct = round((our_sum - total_ppg_value) / total_ppg_value * 100, 1)
+  )
+
+cat("Mediana diff:", median(final$diff_pct, na.rm = TRUE), "%\n")
+cat("Dentro de ±1%:", sum(abs(final$diff_pct) <= 1, na.rm = TRUE), "de", nrow(final), "\n")
+cat("Dentro de ±5%:", sum(abs(final$diff_pct) <= 5, na.rm = TRUE), "de", nrow(final), "\n")
+
+```
+```{r checks}
+final %>%
+  filter(abs(diff_pct) > 50) %>%
+  select(country_name, year, our_sum, total_ppg_value, diff_pct) %>%
+  arrange(desc(diff_pct)) %>%
+  print(n = 20)
+
+summary(final$diff_pct)
+
+```
+
+---
+```{r excel-workbook}
+wb_out <- createWorkbook()
+
+wb_out <- createWorkbook()
+
+# --- Data sheets ---
+
+addWorksheet(wb_out, "Bilateral")
+writeData(wb_out, "Bilateral",
+  bilateral_nonpc %>%
+    select(country_name, country_code, year, income_group,
+           DT.DOD.BLAT.CD_total = bilateral_total,
+           DT.DOD.BLAT.CD_pc = pc_value,
+           DT.DOD.BLAT.CD_nonpc = nonpc_value) %>%
+    arrange(country_name, year))
+
+addWorksheet(wb_out, "Multilateral")
+writeData(wb_out, "Multilateral",
+  multilateral_nonpcs %>%
+    select(country_name, country_code, year, income_group,
+           DT.DOD.MLAT.CD_total = multilateral_total,
+           DT.DOD.MLAT.CD_pcs = pcs_value,
+           DT.DOD.MLAT.CD_nonpcs = nonpcs_value) %>%
+    arrange(country_name, year))
+
+addWorksheet(wb_out, "Bonds")
+writeData(wb_out, "Bonds",
+  bonds %>% arrange(country_name, year))
+
+addWorksheet(wb_out, "Commercial Banks")
+writeData(wb_out, "Commercial Banks",
+  comm_banks %>% arrange(country_name, year))
+
+addWorksheet(wb_out, "Other Private")
+writeData(wb_out, "Other Private",
+  other_private %>% arrange(country_name, year))
+
+addWorksheet(wb_out, "IMF Credit")
+writeData(wb_out, "IMF Credit",
+  imf %>% arrange(country_name, year))
+
+addWorksheet(wb_out, "Total PPG")
+writeData(wb_out, "Total PPG",
+  total_ppg %>% arrange(country_name, year))
+
+# --- Cross-check ---
+
+addWorksheet(wb_out, "Cross-check")
+writeData(wb_out, "Cross-check",
+  final %>%
+    select(country_name, year, income_group, our_sum, total_ppg_value, diff_pct) %>%
+    arrange(country_name, year))
+
+# --- Chart data: Sums (USD billions) ---
+
+make_agg <- function(data, label) {
+  data %>%
+    group_by(year) %>%
+    summarise(
+      Bilateral_PC = sum(pc_value, na.rm = TRUE) / 1e9,
+      Bilateral_NonPC = sum(nonpc_value, na.rm = TRUE) / 1e9,
+      Multilateral_PCS = sum(pcs_value, na.rm = TRUE) / 1e9,
+      Multilateral_NonPCS = sum(nonpcs_value, na.rm = TRUE) / 1e9,
+      Bonds = sum(bonds_value, na.rm = TRUE) / 1e9,
+      Commercial_Banks = sum(commbanks_value, na.rm = TRUE) / 1e9,
+      Other_Private = sum(otherprivate_value, na.rm = TRUE) / 1e9,
+      IMF = sum(imf_value, na.rm = TRUE) / 1e9,
+      .groups = "drop"
+    ) %>%
+    arrange(year)
+}
+
+addWorksheet(wb_out, "Chart - All (sum)")
+writeData(wb_out, "Chart - All (sum)", make_agg(final, "All"))
+
+addWorksheet(wb_out, "Chart - LIC (sum)")
+writeData(wb_out, "Chart - LIC (sum)", make_agg(final %>% filter(income_group == "LIC"), "LIC"))
+
+addWorksheet(wb_out, "Chart - MIC (sum)")
+writeData(wb_out, "Chart - MIC (sum)", make_agg(final %>% filter(income_group == "MIC"), "MIC"))
+
+# --- Chart data: Median shares (%) ---
+
+make_median_pct <- function(data) {
+  data %>%
+    mutate(
+      total = pc_value + nonpc_value + pcs_value + nonpcs_value +
+              replace_na(bonds_value, 0) + replace_na(commbanks_value, 0) +
+              replace_na(otherprivate_value, 0) + replace_na(imf_value, 0)
+    ) %>%
+    filter(total > 0) %>%
+    mutate(
+      pct_Bilateral_PC = pc_value / total * 100,
+      pct_Bilateral_NonPC = nonpc_value / total * 100,
+      pct_Multilateral_PCS = pcs_value / total * 100,
+      pct_Multilateral_NonPCS = nonpcs_value / total * 100,
+      pct_Bonds = replace_na(bonds_value, 0) / total * 100,
+      pct_Commercial_Banks = replace_na(commbanks_value, 0) / total * 100,
+      pct_Other_Private = replace_na(otherprivate_value, 0) / total * 100,
+      pct_IMF = replace_na(imf_value, 0) / total * 100
+    ) %>%
+    group_by(year) %>%
+    summarise(across(starts_with("pct_"), ~median(.x, na.rm = TRUE)), .groups = "drop") %>%
+    arrange(year)
+}
+
+addWorksheet(wb_out, "Chart - All (median %)")
+writeData(wb_out, "Chart - All (median %)", make_median_pct(final))
+
+addWorksheet(wb_out, "Chart - LIC (median %)")
+writeData(wb_out, "Chart - LIC (median %)", make_median_pct(final %>% filter(income_group == "LIC")))
+
+addWorksheet(wb_out, "Chart - MIC (median %)")
+writeData(wb_out, "Chart - MIC (median %)", make_median_pct(final %>% filter(income_group == "MIC")))
+
+# --- Reference ---
+
+addWorksheet(wb_out, "PC Members")
+writeData(wb_out, "PC Members", pc_mapping)
+
+addWorksheet(wb_out, "PCS Institutions")
+writeData(wb_out, "PCS Institutions",
+  data.frame(ca_code = pcs_codes) %>%
+    left_join(
+      ids_long %>% filter(series_code == "DT.DOD.MLAT.CD") %>% distinct(ca_code, ca_name),
+      by = "ca_code") %>%
+    arrange(ca_name))
+
+excel_file <- file.path(output_dir, "ex2_ppg_by_creditor_class.xlsx")
+saveWorkbook(wb_out, excel_file, overwrite = TRUE)
+cat("✓ Saved:", excel_file, "\n")
+
+```
+
+---
+
